@@ -1,0 +1,567 @@
+import os
+import numpy as np
+from PIL import Image
+
+# 超参数
+IMAGE_HEIGHT = 64
+IMAGE_WIDTH = 64
+CHANNELS = 3
+CLASSES = 2
+EPOCHS = 30
+BATCH_SIZE = 32
+LEARNING_RATE = 0.0005
+DROPOUT_RATE = 0.5
+
+# 数据预处理
+def load_data(data_dir):
+    images = []
+    labels = []
+    for label, sub_dir in enumerate(os.listdir(data_dir)):
+        sub_path = os.path.join(data_dir, sub_dir)
+        if not os.path.isdir(sub_path):
+            continue
+        for image_name in os.listdir(sub_path):
+            image_path = os.path.join(sub_path, image_name)
+            try:
+                image = Image.open(image_path).resize((IMAGE_HEIGHT, IMAGE_WIDTH))
+                image = np.array(image) / 255.0  # 归一化
+                images.append(image)
+                labels.append(label)
+            except Exception as e:
+                print(f"Error loading image {image_path}: {e}")
+    return np.array(images), np.array(labels)
+
+# 加载数据
+train_images, train_labels = load_data("dataset/train")
+val_images, val_labels = load_data("dataset/val")
+test_images, test_labels = load_data("dataset/test")
+
+# 将标签转换为独热编码
+def to_one_hot(labels, classes):
+    one_hot = np.zeros((labels.shape[0], classes))
+    one_hot[np.arange(labels.shape[0]), labels.astype(int)] = 1
+    return one_hot
+
+train_labels = to_one_hot(train_labels, CLASSES)
+val_labels = to_one_hot(val_labels, CLASSES)
+test_labels = to_one_hot(test_labels, CLASSES)
+
+# 定义卷积神经网络层
+class Conv2D:
+    def __init__(self, filters, kernel_size, activation=None, input_shape=None):
+        self.filters = filters
+        self.kernel_size = kernel_size
+        self.activation = activation
+        self.input_shape = input_shape
+        self.weights = None
+        self.bias = None
+        self.output = None
+        self.inputs = None
+
+    def initialize_weights(self):
+        if self.input_shape is not None:
+            input_channels = self.input_shape[-1]
+        else:
+            input_channels = self.input_shape[-1]
+        self.weights = np.random.randn(
+            self.kernel_size[0], self.kernel_size[1], input_channels, self.filters
+        ) * np.sqrt(2. / (self.kernel_size[0] * self.kernel_size[1] * input_channels))
+        self.bias = np.zeros((self.filters,))
+
+    def forward(self, x):
+        self.inputs = x
+        batch_size, in_height, in_width, in_channels = x.shape
+        out_height = in_height - self.kernel_size[0] + 1
+        out_width = in_width - self.kernel_size[1] + 1
+
+        self.output = np.zeros((batch_size, out_height, out_width, self.filters))
+
+        for i in range(batch_size):
+            for h in range(out_height):
+                for w in range(out_width):
+                    for f in range(self.filters):
+                        self.output[i, h, w, f] = np.sum(
+                            x[i, h:h + self.kernel_size[0], w:w + self.kernel_size[1], :] * self.weights[:, :, :, f]
+                        ) + self.bias[f]
+
+        if self.activation == "relu":
+            self.output = np.maximum(self.output, 0)
+        elif self.activation == "softmax":
+            exp_scores = np.exp(self.output)
+            self.output = exp_scores / np.sum(exp_scores, axis=-1, keepdims=True)
+
+        return self.output
+
+    def backward(self, dout, learning_rate):
+        batch_size, dout_height, dout_width, dout_channels = dout.shape
+        _, in_height, in_width, in_channels = self.inputs.shape
+
+        dw = np.zeros_like(self.weights)
+        db = np.zeros_like(self.bias)
+        dx = np.zeros_like(self.inputs)
+
+        for i in range(batch_size):
+            for h in range(dout_height):
+                for w in range(dout_width):
+                    for f in range(dout_channels):
+                        dw[:, :, :, f] += self.inputs[i, h:h + self.kernel_size[0], w:w + self.kernel_size[1], :] * \
+                                          dout[i, h, w, f]
+                        db[f] += dout[i, h, w, f]
+                        dx[i, h:h + self.kernel_size[0], w:w + self.kernel_size[1], :] += self.weights[:, :, :, f] * \
+                                                                                          dout[i, h, w, f]
+
+        self.weights -= learning_rate * dw
+        self.bias -= learning_rate * db
+
+        return dx
+
+
+class MaxPooling2D:
+    def __init__(self, pool_size):
+        self.pool_size = pool_size
+        self.output = None
+        self.inputs = None
+        self.mask = None
+
+    def forward(self, x):
+        self.inputs = x
+        batch_size, in_height, in_width, in_channels = x.shape
+        out_height = in_height // self.pool_size[0]
+        out_width = in_width // self.pool_size[1]
+
+        self.output = np.zeros((batch_size, out_height, out_width, in_channels))
+
+        self.mask = np.zeros_like(x, dtype=bool)
+
+        for i in range(batch_size):
+            for h in range(out_height):
+                for w in range(out_width):
+                    for c in range(in_channels):
+                        h_start = h * self.pool_size[0]
+                        h_end = h_start + self.pool_size[0]
+                        w_start = w * self.pool_size[1]
+                        w_end = w_start + self.pool_size[1]
+
+                        patch = x[i, h_start:h_end, w_start:w_end, c]
+                        self.output[i, h, w, c] = np.max(patch)
+
+                        max_idx = np.unravel_index(np.argmax(patch), patch.shape)
+                        self.mask[i, h_start + max_idx[0], w_start + max_idx[1], c] = True
+
+        return self.output
+
+    def backward(self, dout):
+        batch_size, dout_height, dout_width, dout_channels = dout.shape
+        dx = np.zeros_like(self.inputs)
+
+        for i in range(batch_size):
+            for h in range(dout_height):
+                for w in range(dout_width):
+                    for c in range(dout_channels):
+                        h_start = h * self.pool_size[0]
+                        h_end = h_start + self.pool_size[0]
+                        w_start = w * self.pool_size[1]
+                        w_end = w_start + self.pool_size[1]
+
+                        dx[i, h_start:h_end, w_start:w_end, c] = dout[i, h, w, c] * self.mask[i, h_start:h_end,
+                                                                                    w_start:w_end, c]
+
+        return dx
+
+
+class Dense:
+    def __init__(self, units, activation=None):
+        self.units = units
+        self.activation = activation
+        self.weights = None
+        self.bias = None
+        self.output = None
+        self.inputs = None
+
+    def initialize_weights(self, input_shape):
+        self.weights = np.random.randn(input_shape, self.units) * np.sqrt(2. / input_shape)
+        self.bias = np.zeros((self.units,))
+
+    def forward(self, x):
+        self.inputs = x
+        self.output = np.dot(x, self.weights) + self.bias
+
+        if self.activation == "relu":
+            self.output = np.maximum(self.output, 0)
+        elif self.activation == "softmax":
+            exp_scores = np.exp(self.output)
+            self.output = exp_scores / np.sum(exp_scores, axis=-1, keepdims=True)
+
+        return self.output
+
+    def backward(self, dout, learning_rate):
+        if self.activation == "relu":
+            dout[self.output <= 0] = 0
+
+        dw = np.dot(self.inputs.T, dout)
+        db = np.sum(dout, axis=0)
+        dx = np.dot(dout, self.weights.T)
+
+        self.weights -= learning_rate * dw
+        self.bias -= learning_rate * db
+
+        return dx
+
+
+class Dropout:
+    def __init__(self, rate):
+        self.rate = rate
+        self.mask = None
+        self.output = None
+        self.inputs = None
+
+    def forward(self, x, training=True):
+        self.inputs = x
+        if training:
+            self.mask = np.random.binomial(1, 1 - self.rate, size=x.shape)
+            self.output = x * self.mask
+        else:
+            self.output = x * (1 - self.rate)
+        return self.output
+
+    def backward(self, dout, learning_rate):
+        return dout * self.mask
+
+
+class Flatten:
+    def __init__(self):
+        self.output = None
+        self.input_shape = None
+
+    def forward(self, x):
+        self.input_shape = x.shape
+        self.output = x.reshape(x.shape[0], -1)
+        return self.output
+
+    def backward(self, dout):
+        return dout.reshape(self.input_shape)
+
+
+class BatchNormalization:
+    def __init__(self, epsilon=1e-5, momentum=0.9):
+        self.epsilon = epsilon
+        self.momentum = momentum
+        self.gamma = None
+        self.beta = None
+        self.running_mean = None
+        self.running_var = None
+        self.output = None
+        self.inputs = None
+        self.x_centered = None
+        self.x_normalized = None
+        self.batch_mean = None
+        self.batch_var = None
+        self.training = True
+
+    def initialize_weights(self, input_shape):
+        # input_shape 应该是卷积层的输出形状 (height, width, channels) 或全连接层的输入形状 (units,)
+        if len(input_shape) == 3:  # 卷积层的情况
+            self.gamma = np.ones((input_shape[-1],))
+            self.beta = np.zeros((input_shape[-1],))
+            self.running_mean = np.zeros((input_shape[-1],))
+            self.running_var = np.ones((input_shape[-1],))
+        else:  # 全连接层的情况
+            self.gamma = np.ones((input_shape,))
+            self.beta = np.zeros((input_shape,))
+            self.running_mean = np.zeros((input_shape,))
+            self.running_var = np.ones((input_shape,))
+
+    def forward(self, x, training=True):
+        self.inputs = x
+        self.training = training
+
+        if self.training:
+            # 计算当前批次的均值和方差
+            if len(x.shape) == 4:  # 卷积层的输入 (batch, height, width, channels)
+                batch_mean = np.mean(x, axis=(0, 1, 2))
+                batch_var = np.var(x, axis=(0, 1, 2))
+            else:  # 全连接层的输入 (batch, units)
+                batch_mean = np.mean(x, axis=0)
+                batch_var = np.var(x, axis=0)
+
+            # 更新运行均值和方差
+            self.running_mean = self.momentum * self.running_mean + (1 - self.momentum) * batch_mean
+            self.running_var = self.momentum * self.running_var + (1 - self.momentum) * batch_var
+
+            # 归一化
+            self.x_centered = x - batch_mean
+            self.x_normalized = self.x_centered / np.sqrt(batch_var + self.epsilon)
+        else:
+            # 使用运行均值和方差进行归一化
+            self.x_normalized = (x - self.running_mean) / np.sqrt(self.running_var + self.epsilon)
+
+        # 缩放和偏移
+        self.output = self.gamma * self.x_normalized + self.beta
+        return self.output
+
+    def backward(self, dout, learning_rate):
+        if not self.training:
+            raise ValueError("Backward pass should only be called during training")
+
+        # 获取输入数据的形状
+        if len(self.inputs.shape) == 4:  # 卷积层的输入 (batch, height, width, channels)
+            batch_size, height, width, channels = self.inputs.shape
+            # Reshape dout 和 x_normalized 以进行广播
+            dout_reshaped = dout.reshape(-1, channels)
+            x_normalized_reshaped = self.x_normalized.reshape(-1, channels)
+        else:  # 全连接层的输入 (batch, units)
+            batch_size, units = self.inputs.shape
+            dout_reshaped = dout
+            x_normalized_reshaped = self.x_normalized
+
+        # 计算 dgamma 和 dbeta
+        dgamma = np.sum(dout_reshaped * x_normalized_reshaped, axis=0)
+        dbeta = np.sum(dout_reshaped, axis=0)
+
+        # 更新 gamma 和 beta
+        self.gamma -= learning_rate * dgamma
+        self.beta -= learning_rate * dbeta
+
+        # 计算 dx
+        if len(self.inputs.shape) == 4:  # 卷积层的输入
+            dx_normalized = dout * self.gamma
+            dx = dx_normalized / np.sqrt(self.running_var + self.epsilon)
+        else:  # 全连接层的输入
+            dx = dout * self.gamma / np.sqrt(self.running_var + self.epsilon)
+
+        return dx
+
+
+class Model:
+    def __init__(self):
+        self.layers = []
+
+    def add(self, layer):
+        self.layers.append(layer)
+
+    def compile(self):
+        input_shape = (IMAGE_HEIGHT, IMAGE_WIDTH, CHANNELS)
+        for layer in self.layers:
+            if isinstance(layer, Conv2D):
+                layer.input_shape = input_shape
+                layer.initialize_weights()
+                output_height = input_shape[0] - layer.kernel_size[0] + 1
+                output_width = input_shape[1] - layer.kernel_size[1] + 1
+                input_shape = (output_height, output_width, layer.filters)
+            elif isinstance(layer, MaxPooling2D):
+                output_height = input_shape[0] // layer.pool_size[0]
+                output_width = input_shape[1] // layer.pool_size[1]
+                input_shape = (output_height, output_width, input_shape[2])
+            elif isinstance(layer, Flatten):
+                input_shape = np.prod(input_shape)
+            elif isinstance(layer, Dense):
+                layer.initialize_weights(input_shape)
+                input_shape = layer.units
+            elif isinstance(layer, BatchNormalization):
+                layer.initialize_weights(input_shape)
+
+    def train(self, x, y, epochs, batch_size, learning_rate, val_x=None, val_y=None):
+        history = {"loss": [], "accuracy": []}
+        if val_x is not None and val_y is not None:
+            history["val_loss"] = []
+            history["val_accuracy"] = []
+
+        for epoch in range(epochs):
+            permutation = np.random.permutation(x.shape[0])
+            x_shuffled = x[permutation]
+            y_shuffled = y[permutation]
+
+            epoch_loss = 0.0
+            epoch_acc = 0.0
+
+            for i in range(0, x.shape[0], batch_size):
+                batch_x = x_shuffled[i:i + batch_size]
+                batch_y = y_shuffled[i:i + batch_size]
+
+                output = batch_x
+                for layer in self.layers:
+                    if isinstance(layer, Dropout):
+                        output = layer.forward(output, training=True)
+                    else:
+                        output = layer.forward(output)
+
+                loss = self.compute_loss(output, batch_y)
+                acc = self.compute_accuracy(output, batch_y)
+                epoch_loss += loss * batch_x.shape[0]
+                epoch_acc += acc * batch_x.shape[0]
+
+                dout = output - batch_y  # 对于 softmax 激活函数的交叉熵损失，梯度是 output - y
+                for layer in reversed(self.layers):
+                    if isinstance(layer, Conv2D):
+                        dout = layer.backward(dout, learning_rate)
+                    elif isinstance(layer, MaxPooling2D):
+                        dout = layer.backward(dout)
+                    elif isinstance(layer, Dense):
+                        dout = layer.backward(dout, learning_rate)
+                    elif isinstance(layer, Dropout):
+                        dout = layer.backward(dout, learning_rate)
+                    elif isinstance(layer, Flatten):
+                        dout = layer.backward(dout)
+                    elif isinstance(layer, BatchNormalization):
+                        dout = layer.backward(dout, learning_rate)
+
+            epoch_loss /= x.shape[0]
+            epoch_acc /= x.shape[0]
+            history["loss"].append(epoch_loss)
+            history["accuracy"].append(epoch_acc)
+
+            print(f"Epoch {epoch + 1}/{epochs} - Loss: {epoch_loss:.4f}, Accuracy: {epoch_acc:.4f}")
+
+            if val_x is not None and val_y is not None:
+                val_loss, val_acc = self.evaluate(val_x, val_y)
+                history["val_loss"].append(val_loss)
+                history["val_accuracy"].append(val_acc)
+                print(f"Validation Loss: {val_loss:.4f}, Validation Accuracy: {val_acc:.4f}")
+
+        return history
+
+    def evaluate(self, x, y):
+        output = x
+        for layer in self.layers:
+            if isinstance(layer, Dropout):
+                output = layer.forward(output, training=False)
+            else:
+                output = layer.forward(output)
+
+        loss = self.compute_loss(output, y)
+        acc = self.compute_accuracy(output, y)
+        return loss, acc
+
+    def compute_loss(self, output, y):
+        epsilon = 1e-12
+        output = np.clip(output, epsilon, 1. - epsilon)
+        return -np.sum(y * np.log(output)) / output.shape[0]
+
+    def compute_accuracy(self, output, y):
+        pred = np.argmax(output, axis=1)
+        true = np.argmax(y, axis=1)
+        return np.sum(pred == true) / output.shape[0]
+
+    def save(self, filename):
+        params = {}
+        for i, layer in enumerate(self.layers):
+            if isinstance(layer, Conv2D):
+                params[f"layer_{i}_type"] = "Conv2D"
+                params[f"layer_{i}_filters"] = layer.filters
+                params[f"layer_{i}_kernel_size"] = layer.kernel_size
+                params[f"layer_{i}_activation"] = layer.activation
+                params[f"layer_{i}_weights"] = layer.weights
+                params[f"layer_{i}_bias"] = layer.bias
+            elif isinstance(layer, MaxPooling2D):
+                params[f"layer_{i}_type"] = "MaxPooling2D"
+                params[f"layer_{i}_pool_size"] = layer.pool_size
+            elif isinstance(layer, Dense):
+                params[f"layer_{i}_type"] = "Dense"
+                params[f"layer_{i}_units"] = layer.units
+                params[f"layer_{i}_activation"] = layer.activation
+                params[f"layer_{i}_weights"] = layer.weights
+                params[f"layer_{i}_bias"] = layer.bias
+            elif isinstance(layer, Dropout):
+                params[f"layer_{i}_type"] = "Dropout"
+                params[f"layer_{i}_rate"] = layer.rate
+            elif isinstance(layer, Flatten):
+                params[f"layer_{i}_type"] = "Flatten"
+            elif isinstance(layer, BatchNormalization):
+                params[f"layer_{i}_type"] = "BatchNormalization"
+                params[f"layer_{i}_gamma"] = layer.gamma
+                params[f"layer_{i}_beta"] = layer.beta
+                params[f"layer_{i}_running_mean"] = layer.running_mean
+                params[f"layer_{i}_running_var"] = layer.running_var
+
+        np.savez(filename, **params)
+
+    @classmethod
+    def load(cls, filename):
+        params = np.load(filename, allow_pickle=True)
+
+        model = Model()
+        i = 0
+        while True:
+            layer_type = params.get(f"layer_{i}_type", None)
+            if layer_type is None:
+                break
+
+            if layer_type == "Conv2D":
+                filters = params[f"layer_{i}_filters"]
+                kernel_size = tuple(params[f"layer_{i}_kernel_size"])
+                activation = params[f"layer_{i}_activation"]
+                layer = Conv2D(filters, kernel_size, activation)
+                layer.weights = params[f"layer_{i}_weights"]
+                layer.bias = params[f"layer_{i}_bias"]
+                model.add(layer)
+            elif layer_type == "MaxPooling2D":
+                pool_size = tuple(params[f"layer_{i}_pool_size"])
+                layer = MaxPooling2D(pool_size)
+                model.add(layer)
+            elif layer_type == "Dense":
+                units = params[f"layer_{i}_units"]
+                activation = params[f"layer_{i}_activation"]
+                layer = Dense(units, activation)
+                layer.weights = params[f"layer_{i}_weights"]
+                layer.bias = params[f"layer_{i}_bias"]
+                model.add(layer)
+            elif layer_type == "Dropout":
+                rate = params[f"layer_{i}_rate"]
+                layer = Dropout(rate)
+                model.add(layer)
+            elif layer_type == "Flatten":
+                layer = Flatten()
+                model.add(layer)
+            elif layer_type == "BatchNormalization":
+                layer = BatchNormalization()
+                layer.gamma = params[f"layer_{i}_gamma"]
+                layer.beta = params[f"layer_{i}_beta"]
+                layer.running_mean = params[f"layer_{i}_running_mean"]
+                layer.running_var = params[f"layer_{i}_running_var"]
+                model.add(layer)
+            i += 1
+
+        model.compile()
+        return model
+
+
+# 构建模型
+model = Model()
+model.add(Conv2D(32, (3, 3), activation="relu", input_shape=(IMAGE_HEIGHT, IMAGE_WIDTH, CHANNELS)))
+model.add(BatchNormalization())
+model.add(MaxPooling2D((2, 2)))
+model.add(Conv2D(64, (3, 3), activation="relu"))
+model.add(BatchNormalization())
+model.add(MaxPooling2D((2, 2)))
+model.add(Conv2D(128, (3, 3), activation="relu"))
+model.add(BatchNormalization())
+model.add(MaxPooling2D((2, 2)))
+model.add(Flatten())
+model.add(Dense(256, activation="relu"))
+model.add(Dropout(DROPOUT_RATE))
+model.add(Dense(CLASSES, activation="softmax"))
+
+# 编译模型
+model.compile()
+
+# 转换数据形状
+train_images = train_images.reshape(-1, IMAGE_HEIGHT, IMAGE_WIDTH, CHANNELS)
+val_images = val_images.reshape(-1, IMAGE_HEIGHT, IMAGE_WIDTH, CHANNELS)
+test_images = test_images.reshape(-1, IMAGE_HEIGHT, IMAGE_WIDTH, CHANNELS)
+
+# 训练模型
+history = model.train(train_images, train_labels, epochs=EPOCHS, batch_size=BATCH_SIZE, learning_rate=LEARNING_RATE,
+                      val_x=val_images, val_y=val_labels)
+
+# 测试模型
+test_loss, test_acc = model.evaluate(test_images, test_labels)
+print(f"Test Loss: {test_loss:.4f}, Test Accuracy: {test_acc:.4f}")
+
+# 保存模型
+os.makedirs("Model", exist_ok=True)
+model.save("Model/model_1.npz")
+
+# 加载模型并测试
+loaded_model = Model.load("Model/model_1.npz")
+loaded_test_loss, loaded_test_acc = loaded_model.evaluate(test_images, test_labels)
+print(f"Loaded Model Test Loss: {loaded_test_loss:.4f}, Loaded Model Test Accuracy: {loaded_test_acc:.4f}")
